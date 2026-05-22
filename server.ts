@@ -551,11 +551,23 @@ async function main() {
 
   // 7. Start heartbeat
   const heartbeatTimer = setInterval(async () => {
-    // Orphan detection: if our Claude Code parent exited, we were reparented
-    // to init/launchd (PPID=1) and would otherwise keep advertising liveness
-    // to the broker indefinitely. Unregister and exit cleanly instead.
-    if (process.ppid === 1) {
-      log("Parent exited (PPID=1) — orphaned, cleaning up");
+    // Orphan detection: if our Claude Code / Python parent exited, we were
+    // reparented to init/launchd (PPID=1) and would otherwise keep
+    // advertising liveness to the broker indefinitely. Unregister and exit
+    // cleanly instead.
+    //
+    // We CANNOT use `process.ppid` here — verified 2026-05-21 via
+    // /tmp/ppid-test.ts: Bun caches process.ppid at process startup
+    // and never re-queries the OS, so it returns the ORIGINAL parent
+    // PID forever, even after reparenting. The original check
+    // `process.ppid === 1` therefore literally never fired, and
+    // orphaned MCP servers piled up indefinitely on Dave's machine
+    // (8 ghost peers observed in one swarm session). Hit `ps` directly
+    // for the live ppid each tick.
+    const psResult = Bun.spawnSync(["ps", "-o", "ppid=", "-p", String(process.pid)]);
+    const livePpid = parseInt(psResult.stdout.toString().trim(), 10);
+    if (livePpid === 1) {
+      log(`Parent exited (live ppid=1, cached process.ppid=${process.ppid}) — orphaned, cleaning up`);
       await cleanup();
       return;
     }
