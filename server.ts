@@ -467,8 +467,12 @@ mcp.setRequestHandler(CallToolRequestSchema, async (req) => {
 
 async function resolveItermSessionId(tty: string | null): Promise<string | null> {
   if (!tty) return null;
-  // Escape backslashes and quotes in tty path for safe AppleScript string interp.
-  const safeTty = tty.replace(/\\/g, "\\\\").replace(/"/g, '\\"');
+  // Broker stores TTY without the /dev/ prefix (e.g. "ttys002"), but iTerm2's
+  // AppleScript `tty of session` returns the full path ("/dev/ttys002").
+  // Normalize so the comparison succeeds regardless of which form myTty has.
+  const ttyPath = tty.startsWith("/dev/") ? tty : `/dev/${tty}`;
+  // Escape backslashes and quotes for safe AppleScript string interp.
+  const safeTty = ttyPath.replace(/\\/g, "\\\\").replace(/"/g, '\\"');
   const script = `tell application "iTerm"
   repeat with w in windows
     repeat with t in tabs of w
