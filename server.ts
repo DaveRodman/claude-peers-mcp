@@ -501,12 +501,16 @@ end tell`;
 
 async function pokeItermSession(sessionId: string): Promise<void> {
   const safeId = sessionId.replace(/\\/g, "\\\\").replace(/"/g, '\\"');
+  // Use "." instead of " " — Claude Code trims whitespace-only prompts
+  // and refuses to submit them, so a space-only poke fails to trigger
+  // any Stop event. A single non-whitespace character produces one short
+  // visible "." line of UX noise per wake but reliably submits.
   const script = `tell application "iTerm"
   repeat with w in windows
     repeat with t in tabs of w
       repeat with s in sessions of t
         if id of s is "${safeId}" then
-          tell s to write text " "
+          tell s to write text "."
           return
         end if
       end repeat
