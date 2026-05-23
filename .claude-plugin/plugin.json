@@ -1,0 +1,12 @@
+{
+  "name": "claude-peers",
+  "version": "0.1.0",
+  "description": "Peer discovery and messaging channel for Claude Code instances",
+  "author": {
+    "name": "Dave Rodman",
+    "email": "dave@therodmanlawgroup.com"
+  },
+  "homepage": "https://github.com/DaveRodman/claude-peers-mcp",
+  "repository": "https://github.com/DaveRodman/claude-peers-mcp",
+  "license": "MIT"
+}
