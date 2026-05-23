@@ -140,6 +140,12 @@ let myCwd = process.cwd();
 let myGitRoot: string | null = null;
 let myTty: string | null = null;
 
+// iTerm2 session id matching myTty. Set once at boot via osascript discovery.
+// When non-null, pollAndPushMessages pokes the pane on new messages so the
+// Stop hook drains queued messages even when the recipient is idle. Without
+// this, idle panes only surface messages at the user's next manual prompt.
+let myItermSessionId: string | null = null;
+
 // Track message IDs already pushed via mcp.notification to prevent re-delivery spam
 const pushedMessageIds = new Set<number>();
 
@@ -439,6 +445,81 @@ mcp.setRequestHandler(CallToolRequestSchema, async (req) => {
   }
 });
 
+// --- iTerm pane wake (idle-pane delivery) ---
+//
+// Claude Code's Stop hook is the only documented mechanism we have for
+// surfacing channel messages in plugin-loaded MCPs, but it only fires at
+// the END of an LLM turn — idle panes (sitting at the prompt with no LLM
+// activity) never trigger it. To make idle peers feel "instantly poked"
+// the way the original notifications/claude/channel push used to, we
+// inject a single space + Enter into the recipient's iTerm pane via
+// AppleScript when a new message arrives. That submits a near-empty
+// prompt, Claude Code runs one short turn, and the Stop hook drains the
+// queued messages on the way out as <channel> blocks.
+//
+// Tradeoffs:
+//   - macOS + iTerm2 only. Other terminals: poke is a no-op; messages
+//     still arrive at the recipient's next manual turn boundary.
+//   - One short empty/space-prompt turn of visual noise per wake.
+//   - If the user happens to be typing when the poke lands, the injected
+//     space queues with their typing; submission still goes through next
+//     real Enter. Should be benign in practice.
+
+async function resolveItermSessionId(tty: string | null): Promise<string | null> {
+  if (!tty) return null;
+  // Escape backslashes and quotes in tty path for safe AppleScript string interp.
+  const safeTty = tty.replace(/\\/g, "\\\\").replace(/"/g, '\\"');
+  const script = `tell application "iTerm"
+  repeat with w in windows
+    repeat with t in tabs of w
+      repeat with s in sessions of t
+        if (tty of s) is "${safeTty}" then
+          return id of s
+        end if
+      end repeat
+    end repeat
+  end repeat
+  return ""
+end tell`;
+  try {
+    const proc = Bun.spawn(["osascript", "-e", script], {
+      stdout: "pipe",
+      stderr: "pipe",
+    });
+    const out = await new Response(proc.stdout).text();
+    await proc.exited;
+    const id = out.trim();
+    return id.length > 0 ? id : null;
+  } catch {
+    return null;
+  }
+}
+
+async function pokeItermSession(sessionId: string): Promise<void> {
+  const safeId = sessionId.replace(/\\/g, "\\\\").replace(/"/g, '\\"');
+  const script = `tell application "iTerm"
+  repeat with w in windows
+    repeat with t in tabs of w
+      repeat with s in sessions of t
+        if id of s is "${safeId}" then
+          tell s to write text " "
+          return
+        end if
+      end repeat
+    end repeat
+  end repeat
+end tell`;
+  try {
+    const proc = Bun.spawn(["osascript", "-e", script], {
+      stdout: "ignore",
+      stderr: "ignore",
+    });
+    await proc.exited;
+  } catch {
+    // Non-fatal: poke is a UX accelerator, not load-bearing for delivery.
+  }
+}
+
 // --- Polling loop for inbound messages ---
 
 async function pollAndPushMessages() {
@@ -447,9 +528,11 @@ async function pollAndPushMessages() {
   try {
     const result = await brokerFetch<PollMessagesResponse>("/poll-messages", { id: myId });
 
+    let sawNewMessage = false;
     for (const msg of result.messages) {
       if (pushedMessageIds.has(msg.id)) continue;
       pushedMessageIds.add(msg.id);
+      sawNewMessage = true;
 
       // Look up the sender's info for context
       let fromSummary = "";
@@ -485,6 +568,16 @@ async function pollAndPushMessages() {
 
       log(`Pushed message from ${msg.from_id}: ${msg.text.slice(0, 80)}`);
     }
+
+    // Wake the iTerm pane once per poll cycle if any new message arrived.
+    // The Stop hook fires after the resulting empty turn and surfaces every
+    // queued message as a <channel> block. Multiple new messages in one poll
+    // share a single poke — they'll all surface together.
+    if (sawNewMessage && myItermSessionId) {
+      pokeItermSession(myItermSessionId).catch(() => {
+        // Already swallowed inside pokeItermSession; this catch is a belt.
+      });
+    }
   } catch (e) {
     // Broker might be down temporarily, don't crash
     log(`Poll error: ${e instanceof Error ? e.message : String(e)}`);
@@ -505,6 +598,13 @@ async function main() {
   log(`CWD: ${myCwd}`);
   log(`Git root: ${myGitRoot ?? "(none)"}`);
   log(`TTY: ${myTty ?? "(unknown)"}`);
+
+  // Resolve iTerm session ID for the wake-poke path (macOS / iTerm2 only).
+  // Best-effort: any failure leaves myItermSessionId null and disables the
+  // wake feature, which gracefully degrades to "messages delivered at the
+  // recipient's next manual turn boundary" — the pre-wake behavior.
+  myItermSessionId = await resolveItermSessionId(myTty);
+  log(`iTerm session id: ${myItermSessionId ?? "(unresolved — wake-poke disabled)"}`);
 
   // 3. Generate initial summary via gpt-5.4-nano (non-blocking, best-effort)
   let initialSummary = "";
