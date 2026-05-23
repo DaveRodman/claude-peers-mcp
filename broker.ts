@@ -210,13 +210,13 @@ function handleSendMessage(body: SendMessageRequest): { ok: boolean; error?: str
 
 function handlePollMessages(body: PollMessagesRequest): PollMessagesResponse {
   const messages = selectUndelivered.all(body.id) as Message[];
-
-  // Mark them as delivered
-  for (const msg of messages) {
-    markDelivered.run(msg.id);
-  }
-
   return { messages };
+}
+
+function handleMarkDelivered(body: { ids: number[] }): void {
+  for (const id of body.ids) {
+    markDelivered.run(id);
+  }
 }
 
 function handleUnregister(body: { id: string }): void {
@@ -257,6 +257,9 @@ Bun.serve({
           return Response.json(handleSendMessage(body as SendMessageRequest));
         case "/poll-messages":
           return Response.json(handlePollMessages(body as PollMessagesRequest));
+        case "/mark-delivered":
+          handleMarkDelivered(body as { ids: number[] });
+          return Response.json({ ok: true });
         case "/unregister":
           handleUnregister(body as { id: string });
           return Response.json({ ok: true });
