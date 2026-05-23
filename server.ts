@@ -140,6 +140,11 @@ let myCwd = process.cwd();
 let myGitRoot: string | null = null;
 let myTty: string | null = null;
 
+// Track message IDs already pushed via mcp.notification to prevent re-delivery spam
+const pushedMessageIds = new Set<number>();
+
+const RUNTIME_DIR = `${process.env.HOME}/.claude-peers-runtime`;
+
 // --- MCP Server ---
 
 const mcp = new Server(
@@ -381,6 +386,11 @@ mcp.setRequestHandler(CallToolRequestSchema, async (req) => {
             content: [{ type: "text" as const, text: "No new messages." }],
           };
         }
+        // Mark fetched messages as delivered and update dedup set
+        const ids = result.messages.map((m) => m.id);
+        await brokerFetch("/mark-delivered", { ids });
+        for (const id of ids) pushedMessageIds.add(id);
+
         const lines = result.messages.map(
           (m) => `From ${m.from_id} (${m.sent_at}):\n${m.text}`
         );
@@ -438,6 +448,9 @@ async function pollAndPushMessages() {
     const result = await brokerFetch<PollMessagesResponse>("/poll-messages", { id: myId });
 
     for (const msg of result.messages) {
+      if (pushedMessageIds.has(msg.id)) continue;
+      pushedMessageIds.add(msg.id);
+
       // Look up the sender's info for context
       let fromSummary = "";
       let fromCwd = "";
@@ -528,6 +541,14 @@ async function main() {
   myId = reg.id;
   log(`Registered as peer ${myId}`);
 
+  // Write runtime file so the Stop hook can discover our peer ID by MCP server PID
+  try {
+    await Bun.$`mkdir -p ${RUNTIME_DIR}`.quiet();
+    await Bun.write(`${RUNTIME_DIR}/${process.pid}.json`, JSON.stringify({ peer_id: myId }));
+  } catch (e) {
+    log(`Failed to write runtime file (non-critical): ${e instanceof Error ? e.message : String(e)}`);
+  }
+
   // If summary generation is still running, update it when done
   if (!initialSummary) {
     summaryPromise.then(async () => {
@@ -591,6 +612,12 @@ async function main() {
       } catch {
         // Best effort
       }
+    }
+    // Remove runtime file
+    try {
+      await Bun.$`rm -f ${RUNTIME_DIR}/${process.pid}.json`.quiet();
+    } catch {
+      // Best effort
     }
     process.exit(0);
   };
