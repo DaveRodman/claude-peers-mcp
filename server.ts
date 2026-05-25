@@ -499,30 +499,55 @@ end tell`;
   }
 }
 
-async function pokeItermSession(sessionId: string): Promise<void> {
+async function pokeItermSession(sessionId: string, retriesLeft = 6): Promise<void> {
   const safeId = sessionId.replace(/\\/g, "\\\\").replace(/"/g, '\\"');
-  // Use "." instead of " " — Claude Code trims whitespace-only prompts
-  // and refuses to submit them, so a space-only poke fails to trigger
-  // any Stop event. A single non-whitespace character produces one short
-  // visible "." line of UX noise per wake but reliably submits.
+  // Focus-aware poke. If iTerm is frontmost AND this session is the
+  // keyboard-focused pane, the user is (or might be) typing into the
+  // composer — writing "." would clobber their in-progress text and
+  // submit a fragment. Defer instead and retry; if the user keeps
+  // typing past the retry budget, fall through and let the Stop hook
+  // surface the queued message on the next natural turn-end.
+  //
+  // "." (not " ") because Claude Code trims whitespace-only prompts
+  // and refuses to submit them — a space-only poke fails to fire Stop.
   const script = `tell application "iTerm"
+  set isFront to frontmost
+  set focusedId to ""
+  try
+    set focusedId to id of current session of current tab of current window
+  end try
+  if isFront and focusedId is "${safeId}" then
+    return "focused"
+  end if
   repeat with w in windows
     repeat with t in tabs of w
       repeat with s in sessions of t
         if id of s is "${safeId}" then
           tell s to write text "."
-          return
+          return "poked"
         end if
       end repeat
     end repeat
   end repeat
+  return "not-found"
 end tell`;
   try {
     const proc = Bun.spawn(["osascript", "-e", script], {
-      stdout: "ignore",
+      stdout: "pipe",
       stderr: "ignore",
     });
+    const out = (await new Response(proc.stdout).text()).trim();
     await proc.exited;
+    if (out === "focused") {
+      if (retriesLeft > 0) {
+        log(`Poke deferred (session focused, retries left: ${retriesLeft - 1})`);
+        setTimeout(() => {
+          pokeItermSession(sessionId, retriesLeft - 1).catch(() => {});
+        }, 500);
+      } else {
+        log(`Poke gave up after retries — Stop hook will surface on next natural turn-end`);
+      }
+    }
   } catch {
     // Non-fatal: poke is a UX accelerator, not load-bearing for delivery.
   }
@@ -638,13 +663,26 @@ async function main() {
   // Wait briefly for summary, but don't block startup
   await Promise.race([summaryPromise, new Promise((r) => setTimeout(r, 3000))]);
 
-  // 4. Register with broker
+  // 4. Register with broker. Include process_start (output of
+  // `ps -p PID -o lstart=`) so the broker can detect PID reuse later --
+  // a recycled PID will have a different start time than what we record now.
+  let myProcessStart: string | null = null;
+  try {
+    const psResult = Bun.spawnSync(["ps", "-p", String(process.pid), "-o", "lstart="]);
+    if (psResult.exitCode === 0) {
+      const out = new TextDecoder().decode(psResult.stdout).trim();
+      if (out) myProcessStart = out;
+    }
+  } catch {
+    // Non-fatal: broker will fall back to PID-only liveness checks for this peer.
+  }
   const reg = await brokerFetch<RegisterResponse>("/register", {
     pid: process.pid,
     cwd: myCwd,
     git_root: myGitRoot,
     tty: myTty,
     summary: initialSummary,
+    process_start: myProcessStart,
   });
   myId = reg.id;
   log(`Registered as peer ${myId}`);
