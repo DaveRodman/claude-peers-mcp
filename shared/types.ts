@@ -10,6 +10,11 @@ export interface Peer {
   summary: string;
   registered_at: string; // ISO timestamp
   last_seen: string; // ISO timestamp
+  // Output of `ps -p PID -o lstart=` at registration. Paired with pid for
+  // PID-reuse-safe liveness checks (recycled PID has different start time).
+  // Nullable for backward-compat with pre-2026-05 peer rows; new
+  // registrations always include it.
+  process_start: string | null;
 }
 
 export interface Message {
@@ -29,6 +34,10 @@ export interface RegisterRequest {
   git_root: string | null;
   tty: string | null;
   summary: string;
+  // Optional process start-time string (output of `ps -p PID -o lstart=`).
+  // Older clients omit it; the broker stores null in that case and falls
+  // back to PID-only liveness checks for those rows.
+  process_start?: string | null;
 }
 
 export interface RegisterResponse {

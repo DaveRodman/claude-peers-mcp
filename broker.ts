@@ -45,6 +45,16 @@ db.run(`
   )
 `);
 
+// Migration: add process_start column for PID-reuse-safe liveness checks
+// (2026-05-24). Pre-existing rows get NULL; new registrations include it.
+// SQLite throws on duplicate-column; catch and ignore so the migration is
+// idempotent across restarts.
+try {
+  db.run(`ALTER TABLE peers ADD COLUMN process_start TEXT`);
+} catch (_e) {
+  // column already exists — fine
+}
+
 db.run(`
   CREATE TABLE IF NOT EXISTS messages (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -58,15 +68,37 @@ db.run(`
   )
 `);
 
-// Clean up stale peers (PIDs that no longer exist) on startup
+// Return `ps -p PID -o lstart=` output, or null if the PID doesn't exist.
+// macOS-specific output format but only needs to be byte-comparable across
+// calls, not parsed.
+function procStartTime(pid: number): string | null {
+  try {
+    const result = Bun.spawnSync(["ps", "-p", String(pid), "-o", "lstart="]);
+    if (result.exitCode !== 0) return null;
+    const out = new TextDecoder().decode(result.stdout).trim();
+    return out || null;
+  } catch {
+    return null;
+  }
+}
+
+// Clean up stale peers — PID dead OR PID recycled (alive but with a
+// different start time than what we recorded). Recycling-detection
+// matters because macOS reuses PIDs aggressively; without it, a dead
+// peer's slot stays in the active list and routes messages to a black
+// hole (or to whatever unrelated process now owns that PID).
 function cleanStalePeers() {
-  const peers = db.query("SELECT id, pid FROM peers").all() as { id: string; pid: number }[];
+  const peers = db.query("SELECT id, pid, process_start FROM peers")
+    .all() as { id: string; pid: number; process_start: string | null }[];
   for (const peer of peers) {
-    try {
-      // Check if process is still alive (signal 0 doesn't kill, just checks)
-      process.kill(peer.pid, 0);
-    } catch {
-      // Process doesn't exist, remove it
+    let stale = false;
+    const currentStart = procStartTime(peer.pid);
+    if (currentStart === null) {
+      stale = true;  // PID doesn't exist
+    } else if (peer.process_start !== null && currentStart !== peer.process_start) {
+      stale = true;  // PID recycled to a different process
+    }
+    if (stale) {
       db.run("DELETE FROM peers WHERE id = ?", [peer.id]);
       db.run("DELETE FROM messages WHERE to_id = ? AND delivered = 0", [peer.id]);
     }
@@ -81,8 +113,8 @@ setInterval(cleanStalePeers, 30_000);
 // --- Prepared statements ---
 
 const insertPeer = db.prepare(`
-  INSERT INTO peers (id, pid, cwd, git_root, tty, summary, registered_at, last_seen)
-  VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+  INSERT INTO peers (id, pid, cwd, git_root, tty, summary, registered_at, last_seen, process_start)
+  VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
 `);
 
 const updateLastSeen = db.prepare(`
@@ -145,7 +177,11 @@ function handleRegister(body: RegisterRequest): RegisterResponse {
     deletePeer.run(existing.id);
   }
 
-  insertPeer.run(id, body.pid, body.cwd, body.git_root, body.tty, body.summary, now, now);
+  // If client didn't send process_start, fall back to looking it up server-side
+  // from the PID. Caller is on localhost so this is the same PID we'd see in ps.
+  const processStart = body.process_start ?? procStartTime(body.pid);
+
+  insertPeer.run(id, body.pid, body.cwd, body.git_root, body.tty, body.summary, now, now, processStart);
   return { id };
 }
 
@@ -184,16 +220,22 @@ function handleListPeers(body: ListPeersRequest): Peer[] {
     peers = peers.filter((p) => p.id !== body.exclude_id);
   }
 
-  // Verify each peer's process is still alive
+  // Verify each peer's process is still alive AND that the PID hasn't been
+  // recycled to a different process (compare current start time with what
+  // we recorded at registration). Null process_start indicates a pre-2026-05
+  // peer row registered before this check existed — fall back to PID-only.
   return peers.filter((p) => {
-    try {
-      process.kill(p.pid, 0);
-      return true;
-    } catch {
-      // Clean up dead peer
+    const current = procStartTime(p.pid);
+    if (current === null) {
       deletePeer.run(p.id);
       return false;
     }
+    if (p.process_start !== null && current !== p.process_start) {
+      // PID recycled to a different process — original peer is gone.
+      deletePeer.run(p.id);
+      return false;
+    }
+    return true;
   });
 }
 
