@@ -55,6 +55,23 @@ try {
   // column already exists — fine
 }
 
+// Migration: add draining + handoff_path columns (M2.22, 2026-05-26). When
+// a peer self-handoffs (oah-peer soft cap), it sets draining=1 and a path
+// to its partial-state handoff doc. /send-message refuses sends to a
+// draining peer with a structured error so the sender's tool call gets the
+// rejection synchronously — no wasted Gemini turn from the sender having
+// to process an asynchronous bounce-back from the draining peer.
+try {
+  db.run(`ALTER TABLE peers ADD COLUMN draining INTEGER NOT NULL DEFAULT 0`);
+} catch (_e) {
+  // column already exists — fine
+}
+try {
+  db.run(`ALTER TABLE peers ADD COLUMN handoff_path TEXT`);
+} catch (_e) {
+  // column already exists — fine
+}
+
 db.run(`
   CREATE TABLE IF NOT EXISTS messages (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -123,6 +140,14 @@ const updateLastSeen = db.prepare(`
 
 const updateSummary = db.prepare(`
   UPDATE peers SET summary = ? WHERE id = ?
+`);
+
+const updateDraining = db.prepare(`
+  UPDATE peers SET draining = ?, handoff_path = ? WHERE id = ?
+`);
+
+const selectDraining = db.prepare(`
+  SELECT draining, handoff_path FROM peers WHERE id = ?
 `);
 
 const deletePeer = db.prepare(`
@@ -240,13 +265,58 @@ function handleListPeers(body: ListPeersRequest): Peer[] {
 }
 
 function handleSendMessage(body: SendMessageRequest): { ok: boolean; error?: string } {
-  // Verify target exists
-  const target = db.query("SELECT id FROM peers WHERE id = ?").get(body.to_id) as { id: string } | null;
+  // Verify target exists and read drain state in one query.
+  const target = db.query(
+    "SELECT id, draining, handoff_path FROM peers WHERE id = ?",
+  ).get(body.to_id) as {
+    id: string;
+    draining: number | null;
+    handoff_path: string | null;
+  } | null;
   if (!target) {
     return { ok: false, error: `Peer ${body.to_id} not found` };
   }
 
+  // M2.22 — refuse sends to peers that have self-handoffed at their
+  // soft cap. The sender's send_message tool call gets this error as
+  // its synchronous tool result, so the sender's LLM sees "target
+  // draining" and moves on without spending another turn processing
+  // an asynchronous bounce-back message. Cleared automatically when
+  // the peer is unregistered and a successor registers in the same
+  // slot (a new id is generated; the draining flag belongs to the old
+  // id, which is now gone).
+  if (target.draining) {
+    const where = target.handoff_path
+      ? ` (partial-state handoff at ${target.handoff_path})`
+      : "";
+    return {
+      ok: false,
+      error:
+        `Peer ${body.to_id} is draining at its --max-context-tokens soft cap${where}. ` +
+        `Wait for the coordinator to respawn it before re-routing this task.`,
+    };
+  }
+
   insertMessage.run(body.from_id, body.to_id, body.text, new Date().toISOString());
+  return { ok: true };
+}
+
+function handleSetDraining(body: {
+  id: string;
+  draining: boolean;
+  handoff_path?: string | null;
+}): { ok: boolean; error?: string } {
+  const target = db.query("SELECT id FROM peers WHERE id = ?").get(body.id) as
+    | { id: string }
+    | null;
+  if (!target) {
+    return { ok: false, error: `Peer ${body.id} not found` };
+  }
+  updateDraining.run(
+    body.draining ? 1 : 0,
+    body.handoff_path ?? null,
+    body.id,
+  );
   return { ok: true };
 }
 
@@ -297,6 +367,12 @@ Bun.serve({
           return Response.json(handleListPeers(body as ListPeersRequest));
         case "/send-message":
           return Response.json(handleSendMessage(body as SendMessageRequest));
+        case "/set-draining":
+          return Response.json(handleSetDraining(body as {
+            id: string;
+            draining: boolean;
+            handoff_path?: string | null;
+          }));
         case "/poll-messages":
           return Response.json(handlePollMessages(body as PollMessagesRequest));
         case "/mark-delivered":
