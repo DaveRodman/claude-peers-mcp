@@ -40,6 +40,16 @@ const POLL_INTERVAL_MS = 1000;
 const HEARTBEAT_INTERVAL_MS = 15_000;
 const BROKER_SCRIPT = new URL("./broker.ts", import.meta.url).pathname;
 
+/** Whether a /heartbeat response means the broker has forgotten us and we must
+ * re-register. `known === false` = the broker has no row for our id (it
+ * restarted or was cleared). A missing `known` field = older broker that
+ * doesn't report it; don't churn. */
+export function shouldReregister(
+  hb: { ok: boolean; known?: boolean } | null | undefined,
+): boolean {
+  return !!hb && hb.known === false;
+}
+
 // --- Broker communication ---
 
 async function brokerFetch<T>(path: string, body: unknown): Promise<T> {
@@ -676,24 +686,30 @@ async function main() {
   } catch {
     // Non-fatal: broker will fall back to PID-only liveness checks for this peer.
   }
-  const reg = await brokerFetch<RegisterResponse>("/register", {
-    pid: process.pid,
-    cwd: myCwd,
-    git_root: myGitRoot,
-    tty: myTty,
-    summary: initialSummary,
-    process_start: myProcessStart,
-  });
-  myId = reg.id;
-  log(`Registered as peer ${myId}`);
+  // Registration is a reusable function so the heartbeat can re-register if the
+  // broker forgets us (e.g. after a broker restart). See shouldReregister.
+  async function register(): Promise<void> {
+    const reg = await brokerFetch<RegisterResponse>("/register", {
+      pid: process.pid,
+      cwd: myCwd,
+      git_root: myGitRoot,
+      tty: myTty,
+      summary: initialSummary,
+      process_start: myProcessStart,
+    });
+    myId = reg.id;
+    log(`Registered as peer ${myId}`);
 
-  // Write runtime file so the Stop hook can discover our peer ID by MCP server PID
-  try {
-    await Bun.$`mkdir -p ${RUNTIME_DIR}`.quiet();
-    await Bun.write(`${RUNTIME_DIR}/${process.pid}.json`, JSON.stringify({ peer_id: myId }));
-  } catch (e) {
-    log(`Failed to write runtime file (non-critical): ${e instanceof Error ? e.message : String(e)}`);
+    // Write runtime file so the Stop hook can discover our peer ID by MCP server PID
+    try {
+      await Bun.$`mkdir -p ${RUNTIME_DIR}`.quiet();
+      await Bun.write(`${RUNTIME_DIR}/${process.pid}.json`, JSON.stringify({ peer_id: myId }));
+    } catch (e) {
+      log(`Failed to write runtime file (non-critical): ${e instanceof Error ? e.message : String(e)}`);
+    }
   }
+
+  await register();
 
   // If summary generation is still running, update it when done
   if (!initialSummary) {
@@ -740,9 +756,14 @@ async function main() {
     }
     if (myId) {
       try {
-        await brokerFetch("/heartbeat", { id: myId });
+        const hb = await brokerFetch<{ ok: boolean; known?: boolean }>("/heartbeat", { id: myId });
+        if (shouldReregister(hb)) {
+          log(`Broker no longer knows peer ${myId} (likely restarted) — re-registering`);
+          await register();
+          log(`Re-registered as peer ${myId}`);
+        }
       } catch {
-        // Non-critical
+        // Broker unreachable this tick (e.g. mid-restart); keep myId, next tick retries.
       }
     }
   }, HEARTBEAT_INTERVAL_MS);
@@ -772,7 +793,9 @@ async function main() {
   process.on("SIGTERM", cleanup);
 }
 
-main().catch((e) => {
-  log(`Fatal: ${e instanceof Error ? e.message : String(e)}`);
-  process.exit(1);
-});
+if (import.meta.main) {
+  main().catch((e) => {
+    log(`Fatal: ${e instanceof Error ? e.message : String(e)}`);
+    process.exit(1);
+  });
+}
