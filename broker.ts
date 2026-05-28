@@ -26,6 +26,9 @@ import type {
 const PORT = parseInt(process.env.CLAUDE_PEERS_PORT ?? "7899", 10);
 const DB_PATH = process.env.CLAUDE_PEERS_DB ?? `${process.env.HOME}/.claude-peers.db`;
 
+// --- Uptime tracking ---
+const STARTED_AT = Date.now();
+
 // --- Database setup ---
 
 const db = new Database(DB_PATH);
@@ -99,12 +102,28 @@ function procStartTime(pid: number): string | null {
   }
 }
 
+// Sentinel round-trip to verify DB is writable and reads back correctly.
+function sentinelRoundTrip(): void {
+  const v = (db.query("PRAGMA user_version").get() as any).user_version as number;
+  db.run(`PRAGMA user_version = ${v + 1}`);
+  const back = (db.query("PRAGMA user_version").get() as any).user_version as number;
+  if (back !== v + 1) throw new Error("sentinel readback mismatch");
+}
+
 // Clean up stale peers — PID dead OR PID recycled (alive but with a
 // different start time than what we recorded). Recycling-detection
 // matters because macOS reuses PIDs aggressively; without it, a dead
 // peer's slot stays in the active list and routes messages to a black
 // hole (or to whatever unrelated process now owns that PID).
 function cleanStalePeers() {
+  // Self-liveness: detect a stuck DB and exit so a fresh broker can take over.
+  try {
+    sentinelRoundTrip();
+  } catch (e) {
+    console.error("[broker] DB liveness check failed, exiting so a fresh broker can take the port:", e);
+    process.exit(1);
+  }
+
   const peers = db.query("SELECT id, pid, process_start FROM peers")
     .all() as { id: string; pid: number; process_start: string | null }[];
   for (const peer of peers) {
@@ -120,6 +139,9 @@ function cleanStalePeers() {
       db.run("DELETE FROM messages WHERE to_id = ? AND delivered = 0", [peer.id]);
     }
   }
+
+  // Periodically checkpoint the WAL so it can't balloon.
+  db.run("PRAGMA wal_checkpoint(TRUNCATE)");
 }
 
 cleanStalePeers();
@@ -210,8 +232,9 @@ function handleRegister(body: RegisterRequest): RegisterResponse {
   return { id };
 }
 
-function handleHeartbeat(body: HeartbeatRequest): void {
-  updateLastSeen.run(new Date().toISOString(), body.id);
+function handleHeartbeat(body: HeartbeatRequest): boolean {
+  const result = updateLastSeen.run(new Date().toISOString(), body.id);
+  return result.changes > 0;
 }
 
 function handleSetSummary(body: SetSummaryRequest): void {
@@ -346,7 +369,23 @@ Bun.serve({
 
     if (req.method !== "POST") {
       if (path === "/health") {
-        return Response.json({ status: "ok", peers: (selectAllPeers.all() as Peer[]).length });
+        // Honest health: real write+read round-trip + diagnostics.
+        try {
+          sentinelRoundTrip();
+        } catch (e) {
+          const msg = e instanceof Error ? e.message : String(e);
+          return Response.json({ status: "degraded", error: msg }, { status: 500 });
+        }
+
+        const peers = (selectAllPeers.all() as Peer[]).length;
+        const uptime_s = Math.round((Date.now() - STARTED_AT) / 1000);
+        let wal_bytes = 0;
+        try {
+          wal_bytes = (await import("node:fs")).statSync(DB_PATH + "-wal").size;
+        } catch {
+          wal_bytes = 0;
+        }
+        return Response.json({ status: "ok", peers, db_writable: true, uptime_s, wal_bytes });
       }
       return new Response("claude-peers broker", { status: 200 });
     }
@@ -358,8 +397,7 @@ Bun.serve({
         case "/register":
           return Response.json(handleRegister(body as RegisterRequest));
         case "/heartbeat":
-          handleHeartbeat(body as HeartbeatRequest);
-          return Response.json({ ok: true });
+          return Response.json({ ok: true, known: handleHeartbeat(body as HeartbeatRequest) });
         case "/set-summary":
           handleSetSummary(body as SetSummaryRequest);
           return Response.json({ ok: true });
