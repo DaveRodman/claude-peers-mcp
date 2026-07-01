@@ -139,3 +139,11 @@ bun --hot ./index.ts
 ```
 
 For more information, read the Bun API docs in `node_modules/bun-types/docs/**.mdx`.
+
+## Decision records (ADRs)
+
+When a **major, consequential, or hard-to-reverse decision** is made in this repo —
+architecture, deployment topology, provider/model routing, security tradeoffs, or anything
+with an *accepted risk* or a *"valid until X"* condition — **record it as an ADR** in
+`docs/decisions/` (numbered `NNNN-title.md`: Status, Context, Decision, Consequences, and a revisit
+trigger if it's conditions-dependent). Don't let the rationale live only in a code comment.
