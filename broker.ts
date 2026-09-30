@@ -102,6 +102,17 @@ function procStartTime(pid: number): string | null {
   }
 }
 
+// A failed `ps` may mean permission denied or a transient spawn failure.
+// Only ESRCH from an independent check proves the PID is gone.
+function processIsGone(pid: number): boolean {
+  try {
+    process.kill(pid, 0);
+    return false;
+  } catch (error) {
+    return (error as NodeJS.ErrnoException).code === "ESRCH";
+  }
+}
+
 // Sentinel round-trip to verify DB is writable and reads back correctly.
 function sentinelRoundTrip(): void {
   const v = (db.query("PRAGMA user_version").get() as any).user_version as number;
@@ -130,7 +141,7 @@ function cleanStalePeers() {
     let stale = false;
     const currentStart = procStartTime(peer.pid);
     if (currentStart === null) {
-      stale = true;  // PID doesn't exist
+      stale = processIsGone(peer.pid);
     } else if (peer.process_start !== null && currentStart !== peer.process_start) {
       stale = true;  // PID recycled to a different process
     }
@@ -143,11 +154,6 @@ function cleanStalePeers() {
   // Periodically checkpoint the WAL so it can't balloon.
   db.run("PRAGMA wal_checkpoint(TRUNCATE)");
 }
-
-cleanStalePeers();
-
-// Periodically clean stale peers (every 30s)
-setInterval(cleanStalePeers, 30_000);
 
 // --- Prepared statements ---
 
@@ -275,8 +281,11 @@ function handleListPeers(body: ListPeersRequest): Peer[] {
   return peers.filter((p) => {
     const current = procStartTime(p.pid);
     if (current === null) {
-      deletePeer.run(p.id);
-      return false;
+      if (processIsGone(p.pid)) {
+        deletePeer.run(p.id);
+        return false;
+      }
+      return true;
     }
     if (p.process_start !== null && current !== p.process_start) {
       // PID recycled to a different process — original peer is gone.
@@ -428,5 +437,9 @@ Bun.serve({
     }
   },
 });
+
+// Bind first. A duplicate broker must fail before it can mutate the shared DB.
+cleanStalePeers();
+setInterval(cleanStalePeers, 30_000);
 
 console.error(`[claude-peers broker] listening on 127.0.0.1:${PORT} (db: ${DB_PATH})`);
