@@ -102,6 +102,21 @@ function procStartTime(pid: number): string | null {
   }
 }
 
+// `ps -o lstart=` prints the start time in the Mac's CURRENT time zone, so a
+// time-zone change (e.g. travel) shifts every string while the processes are
+// unchanged. Treat two values as the same process when they are identical, or
+// when they differ only by a whole time-zone offset (multiple of 15 minutes,
+// at most 26 hours apart). A recycled PID landing on exactly such an offset,
+// to the second, is not a realistic case.
+function sameProcessStart(recorded: string, current: string): boolean {
+  if (recorded === current) return true;
+  const a = Date.parse(recorded);
+  const b = Date.parse(current);
+  if (Number.isNaN(a) || Number.isNaN(b)) return false;
+  const diff = Math.abs(a - b);
+  return diff <= 26 * 3600_000 && diff % (15 * 60_000) === 0;
+}
+
 // A failed `ps` may mean permission denied or a transient spawn failure.
 // Only ESRCH from an independent check proves the PID is gone.
 function processIsGone(pid: number): boolean {
@@ -142,7 +157,7 @@ function cleanStalePeers() {
     const currentStart = procStartTime(peer.pid);
     if (currentStart === null) {
       stale = processIsGone(peer.pid);
-    } else if (peer.process_start !== null && currentStart !== peer.process_start) {
+    } else if (peer.process_start !== null && !sameProcessStart(peer.process_start, currentStart)) {
       stale = true;  // PID recycled to a different process
     }
     if (stale) {
@@ -287,7 +302,7 @@ function handleListPeers(body: ListPeersRequest): Peer[] {
       }
       return true;
     }
-    if (p.process_start !== null && current !== p.process_start) {
+    if (p.process_start !== null && !sameProcessStart(p.process_start, current)) {
       // PID recycled to a different process — original peer is gone.
       deletePeer.run(p.id);
       return false;

@@ -127,3 +127,47 @@ test("failed process inspection preserves a live peer at startup and in listings
     try { Bun.file(isolatedDb + "-shm").delete(); } catch {}
   }
 });
+
+test("a time-zone change does not evict live peers, but a recycled PID still does", async () => {
+  const lstartIn = (tz: string) => new TextDecoder().decode(
+    Bun.spawnSync(["ps", "-p", String(process.pid), "-o", "lstart="], { env: { ...process.env, TZ: tz } }).stdout,
+  ).trim();
+  const recordedInDenver = lstartIn("America/Denver");
+  expect(recordedInDenver).not.toBe(lstartIn("Asia/Singapore"));
+
+  const isolatedPort = PORT + 2;
+  const isolatedDb = `/tmp/cp-test-${crypto.randomUUID()}.db`;
+  const db = new Database(isolatedDb);
+  db.run(`CREATE TABLE peers (id TEXT PRIMARY KEY, pid INTEGER NOT NULL, cwd TEXT NOT NULL,
+    git_root TEXT, tty TEXT, summary TEXT NOT NULL DEFAULT '', registered_at TEXT NOT NULL,
+    last_seen TEXT NOT NULL, process_start TEXT)`);
+  const now = new Date().toISOString();
+  db.run("INSERT INTO peers VALUES (?, ?, ?, NULL, NULL, '', ?, ?, ?)",
+    ["traveller", process.pid, process.cwd(), now, now, recordedInDenver]);
+  db.run("INSERT INTO peers VALUES (?, ?, ?, NULL, NULL, '', ?, ?, ?)",
+    ["recycled", process.pid, process.cwd(), now, now, "Mon Jan  1 00:00:00 2001"]);
+  db.close();
+  const isolated = Bun.spawn([process.execPath, "broker.ts"], {
+    env: { ...process.env, TZ: "Asia/Singapore", CLAUDE_PEERS_PORT: String(isolatedPort),
+      CLAUDE_PEERS_DB: isolatedDb },
+    cwd: import.meta.dir,
+    stdout: "ignore",
+    stderr: "inherit",
+  });
+  try {
+    await new Promise((resolve) => setTimeout(resolve, 500));
+    const listing = await fetch(`http://127.0.0.1:${isolatedPort}/list-peers`, {
+      method: "POST", headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ scope: "machine" }),
+    });
+    const ids = (await listing.json()).map((peer: { id: string }) => peer.id);
+    expect(ids).toContain("traveller");
+    expect(ids).not.toContain("recycled");
+  } finally {
+    isolated.kill("SIGTERM");
+    await isolated.exited;
+    try { Bun.file(isolatedDb).delete(); } catch {}
+    try { Bun.file(isolatedDb + "-wal").delete(); } catch {}
+    try { Bun.file(isolatedDb + "-shm").delete(); } catch {}
+  }
+});
