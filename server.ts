@@ -13,6 +13,7 @@
  *   { "claude-peers": { "command": "bun", "args": ["./server.ts"] } }
  */
 
+import { openSync, closeSync } from "node:fs";
 import { Server } from "@modelcontextprotocol/sdk/server/index.js";
 import { StdioServerTransport } from "@modelcontextprotocol/sdk/server/stdio.js";
 import {
@@ -39,6 +40,14 @@ const BROKER_URL = `http://127.0.0.1:${BROKER_PORT}`;
 const POLL_INTERVAL_MS = 1000;
 const HEARTBEAT_INTERVAL_MS = 15_000;
 const BROKER_SCRIPT = new URL("./broker.ts", import.meta.url).pathname;
+const BROKER_LOG = process.env.CLAUDE_PEERS_BROKER_LOG ?? `${process.env.HOME}/.claude-peers-broker.log`;
+
+// Only top-level sessions (a swarm coordinator, or a peer session Dave opens
+// himself) may start the broker. Swarm workers are launched with
+// CLAUDE_AUTO_SWARM_ROLE set; they only connect, and wait if it is down.
+export function mayStartBroker(env: Record<string, string | undefined> = process.env): boolean {
+  return !env.CLAUDE_AUTO_SWARM_ROLE;
+}
 
 /** Whether a /heartbeat response means the broker has forgotten us and we must
  * re-register. `known === false` = the broker has no row for our id (it
@@ -74,31 +83,42 @@ async function isBrokerAlive(): Promise<boolean> {
   }
 }
 
-async function ensureBroker(): Promise<void> {
+// Returns true once a broker is reachable. Always checks first, so a running
+// broker is reused and never duplicated.
+export async function ensureBroker(): Promise<boolean> {
   if (await isBrokerAlive()) {
     log("Broker already running");
-    return;
+    return true;
+  }
+
+  if (!mayStartBroker()) {
+    log("Broker not running; swarm workers never start one. Waiting for it.");
+    return false;
   }
 
   log("Starting broker daemon...");
-  const proc = Bun.spawn(["bun", BROKER_SCRIPT], {
-    stdio: ["ignore", "ignore", "inherit"],
-    // Detach so the broker survives if this MCP server exits
-    // On macOS/Linux, the broker will keep running
-  });
+  const logFd = openSync(BROKER_LOG, "a");
+  const proc = Bun.spawn([process.execPath, BROKER_SCRIPT], {
+    stdio: ["ignore", logFd, logFd],
+    // Own process group + session, so closing this Claude session (which
+    // signals its whole group) can't take the broker down with it.
+    detached: true,
+  } as Parameters<typeof Bun.spawn>[1]);
 
   // Unref so this process can exit without waiting for the broker
   proc.unref();
+  closeSync(logFd);
 
   // Wait for it to come up
   for (let i = 0; i < 30; i++) {
     await new Promise((r) => setTimeout(r, 200));
     if (await isBrokerAlive()) {
       log("Broker started");
-      return;
+      return true;
     }
   }
-  throw new Error("Failed to start broker daemon after 6 seconds");
+  log("Broker did not come up within 6 seconds; will retry on the next heartbeat");
+  return false;
 }
 
 // --- Utility ---
@@ -709,7 +729,13 @@ async function main() {
     }
   }
 
-  await register();
+  try {
+    await register();
+  } catch (e) {
+    // Broker not up yet (e.g. a worker waiting for its coordinator's broker).
+    // The heartbeat keeps trying and registers as soon as it appears.
+    log(`Not registered yet: ${e instanceof Error ? e.message : String(e)}`);
+  }
 
   // If summary generation is still running, update it when done
   if (!initialSummary) {
@@ -733,6 +759,7 @@ async function main() {
   const pollTimer = setInterval(pollAndPushMessages, POLL_INTERVAL_MS);
 
   // 7. Start heartbeat
+  let brokerDownLogged = false;
   const heartbeatTimer = setInterval(async () => {
     // Orphan detection: if our Claude Code / Python parent exited, we were
     // reparented to init/launchd (PPID=1) and would otherwise keep
@@ -754,17 +781,26 @@ async function main() {
       await cleanup();
       return;
     }
-    if (myId) {
-      try {
+    try {
+      if (!myId) {
+        await register();
+      } else {
         const hb = await brokerFetch<{ ok: boolean; known?: boolean }>("/heartbeat", { id: myId });
         if (shouldReregister(hb)) {
           log(`Broker no longer knows peer ${myId} (likely restarted) — re-registering`);
           await register();
           log(`Re-registered as peer ${myId}`);
         }
-      } catch {
-        // Broker unreachable this tick (e.g. mid-restart); keep myId, next tick retries.
       }
+      brokerDownLogged = false;
+    } catch {
+      // Broker unreachable. Log once per outage, not every tick. A top-level
+      // session starts a fresh broker; a worker just waits for one.
+      if (!brokerDownLogged) {
+        log(mayStartBroker() ? "Broker unreachable; starting a new one" : "Broker unreachable; waiting for it");
+        brokerDownLogged = true;
+      }
+      if (mayStartBroker()) await ensureBroker();
     }
   }, HEARTBEAT_INTERVAL_MS);
 

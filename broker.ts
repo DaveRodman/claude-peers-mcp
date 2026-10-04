@@ -457,4 +457,24 @@ Bun.serve({
 cleanStalePeers();
 setInterval(cleanStalePeers, 30_000);
 
+// Idle shutdown: once no peer has been connected for IDLE_SHUTDOWN_MS (default
+// 15 minutes), exit. Sleeping panes stay registered, so sleep never triggers
+// this; only closing every pane does. The next coordinator or top-level peer
+// session starts a fresh broker.
+const IDLE_SHUTDOWN_MS = parseInt(process.env.CLAUDE_PEERS_IDLE_SHUTDOWN_MS ?? String(15 * 60_000), 10);
+let emptySince: number | null = null;
+function shutDownIfIdle() {
+  const { n } = db.query("SELECT COUNT(*) AS n FROM peers").get() as { n: number };
+  if (n > 0) {
+    emptySince = null;
+    return;
+  }
+  emptySince ??= Date.now();
+  if (Date.now() - emptySince >= IDLE_SHUTDOWN_MS) {
+    console.error(`[claude-peers broker] no peers for ${Math.round(IDLE_SHUTDOWN_MS / 60_000)} min; shutting down`);
+    process.exit(0);
+  }
+}
+setInterval(shutDownIfIdle, Math.min(30_000, Math.max(250, IDLE_SHUTDOWN_MS / 4)));
+
 console.error(`[claude-peers broker] listening on 127.0.0.1:${PORT} (db: ${DB_PATH})`);
