@@ -95,6 +95,11 @@ db.run(`
 // the live DB, so this is a no-op there and a fresh DB gets it too.
 db.run(`CREATE INDEX IF NOT EXISTS idx_messages_to_delivered ON messages(to_id, delivered)`);
 
+// The prune query filters on (delivered, sent_at), which the index above
+// cannot serve (to_id leads it). This second index keeps the periodic prune
+// from scanning the whole table.
+db.run(`CREATE INDEX IF NOT EXISTS idx_messages_delivered_sent ON messages(delivered, sent_at)`);
+
 // Return `ps -p PID -o lstart=` output, or null if the PID doesn't exist.
 // macOS-specific output format but only needs to be byte-comparable across
 // calls, not parsed.
@@ -179,12 +184,25 @@ function cleanStalePeers() {
 
 // --- Message retention / archiving ---
 
+// Parse an env var as a positive integer, falling back to the default when it
+// is missing, unparseable, or zero/negative. A NaN interval would make
+// setInterval fire in a tight loop, so this must never return NaN.
+function envInt(name: string, fallback: number): number {
+  const raw = process.env[name];
+  if (raw === undefined || raw.trim() === "") return fallback;
+  const n = Number.parseInt(raw, 10);
+  if (!Number.isFinite(n) || n < 1) return fallback;
+  return n;
+}
+
 // Delivered messages older than this are archived to JSONL and deleted.
 // Undelivered messages are never touched, no matter how old.
-const RETENTION_DAYS = parseInt(process.env.CLAUDE_PEERS_RETENTION_DAYS ?? "7", 10);
+const RETENTION_DAYS = envInt("CLAUDE_PEERS_RETENTION_DAYS", 7);
 const ARCHIVE_DIR = process.env.CLAUDE_PEERS_ARCHIVE_DIR ?? `${process.env.HOME}/.claude-peers-archive`;
 const ARCHIVE_PATH = `${ARCHIVE_DIR}/messages-archive.jsonl`;
-// Rows per pass, so a large backlog can't block the broker's event loop.
+// Rows per batch. Each batch is short (one append + one transaction) and the
+// drain below yields to the event loop between batches, so a large backlog
+// drains over a few minutes without ever blocking the broker for long.
 const PRUNE_BATCH = 5000;
 
 type ArchivedMessage = {
@@ -202,6 +220,19 @@ const selectExpired = db.prepare(`
   ORDER BY sent_at ASC
   LIMIT ?
 `);
+
+let pruneDrainScheduled = false;
+
+// A full batch means there is probably more backlog. Schedule another pass
+// shortly, but never stack timers: one drain at a time.
+function schedulePruneDrain() {
+  if (pruneDrainScheduled) return;
+  pruneDrainScheduled = true;
+  setTimeout(() => {
+    pruneDrainScheduled = false;
+    pruneMessages();
+  }, 1000);
+}
 
 // Append the batch to the archive, fsync, and only then delete those exact ids
 // in one transaction. If anything in the append fails we delete nothing.
@@ -230,7 +261,14 @@ function pruneMessages() {
           text: r.text,
         }))
         .join("\n") + "\n";
-      writeSync(fd, payload);
+      // writeSync may write fewer bytes than asked; loop until all are out.
+      const buf = Buffer.from(payload, "utf8");
+      let written = 0;
+      while (written < buf.length) {
+        const n = writeSync(fd, buf, written, buf.length - written);
+        if (n <= 0) throw new Error(`short write to archive (${written}/${buf.length} bytes)`);
+        written += n;
+      }
       fsyncSync(fd);
     } finally {
       closeSync(fd);
@@ -244,6 +282,10 @@ function pruneMessages() {
     deleteBatch(ids);
 
     console.error(`[claude-peers broker] archived ${rows.length} delivered message(s) older than ${RETENTION_DAYS}d to ${ARCHIVE_PATH}`);
+
+    // Full batch: there is likely more backlog. Come back soon so a big
+    // backlog drains in minutes rather than hours.
+    if (rows.length === PRUNE_BATCH) schedulePruneDrain();
   } catch (e) {
     console.error("[claude-peers broker] message archive failed; nothing deleted:", e);
   }
@@ -538,10 +580,7 @@ setInterval(cleanStalePeers, 30_000);
 
 // Archive + prune old delivered messages once shortly after startup, then
 // hourly. Interval is overridable so tests can trigger a prune quickly.
-const PRUNE_INTERVAL_MS = parseInt(
-  process.env.CLAUDE_PEERS_PRUNE_INTERVAL_MS ?? String(60 * 60_000),
-  10,
-);
+const PRUNE_INTERVAL_MS = envInt("CLAUDE_PEERS_PRUNE_INTERVAL_MS", 60 * 60_000);
 setTimeout(pruneMessages, 50);
 setInterval(pruneMessages, PRUNE_INTERVAL_MS);
 
