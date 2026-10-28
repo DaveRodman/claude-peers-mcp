@@ -367,3 +367,98 @@ test('falls back to the default retention when the env value is unparseable', as
     try { Bun.file(dbPath + '-shm').delete(); } catch {}
   }
 });
+
+
+// --- Slow-request / event-loop-lag logging ---
+
+function collectStderr(proc: ReturnType<typeof Bun.spawn>): () => string {
+  let text = '';
+  const decoder = new TextDecoder();
+  const reader = (proc.stderr as ReadableStream<Uint8Array>).getReader();
+  void (async () => {
+    for (;;) {
+      const { done, value } = await reader.read();
+      if (done) break;
+      text += decoder.decode(value, { stream: true });
+    }
+  })();
+  return () => text;
+}
+
+function cleanupDb(dbPath: string) {
+  for (const suffix of ['', '-wal', '-shm']) {
+    try { rmSync(dbPath + suffix, { force: true }); } catch {}
+  }
+}
+
+function spawnLoggingBroker(port: number, extraEnv: Record<string, string>) {
+  const dbPath = `/tmp/cp-test-${crypto.randomUUID()}.db`;
+  const proc = Bun.spawn([process.execPath, 'broker.ts'], {
+    env: { ...process.env, CLAUDE_PEERS_PORT: String(port), CLAUDE_PEERS_DB: dbPath, ...extraEnv },
+    cwd: import.meta.dir,
+    stdout: 'ignore',
+    stderr: 'pipe',
+  });
+  return { proc, dbPath, stderr: collectStderr(proc) };
+}
+
+test('logs slow requests and slow periodic jobs, with a UTC time and load average', async () => {
+  const port = PORT + 10;
+  const b = spawnLoggingBroker(port, { CLAUDE_PEERS_SLOW_MS: '0' });
+  try {
+    await new Promise((r) => setTimeout(r, 700));
+    const res = await fetch(`http://127.0.0.1:${port}/health`);
+    expect(res.status).toBe(200);
+    await new Promise((r) => setTimeout(r, 500));
+
+    const text = b.stderr();
+    expect(text).toMatch(/slow request \d{4}-\d{2}-\d{2}T[\d:.]+Z \/health \d+ms load=/);
+    expect(text).toMatch(/slow job \d{4}-\d{2}-\d{2}T[\d:.]+Z cleanStalePeers \d+ms load=/);
+    expect(text).toMatch(/slow job \d{4}-\d{2}-\d{2}T[\d:.]+Z pruneMessages \d+ms load=/);
+  } finally {
+    b.proc.kill('SIGTERM');
+    await b.proc.exited;
+    cleanupDb(b.dbPath);
+  }
+});
+
+test('does not log fast requests or fast jobs', async () => {
+  const port = PORT + 11;
+  const b = spawnLoggingBroker(port, { CLAUDE_PEERS_SLOW_MS: '60000' });
+  try {
+    await new Promise((r) => setTimeout(r, 700));
+    await fetch(`http://127.0.0.1:${port}/health`);
+    await fetch(`http://127.0.0.1:${port}/`);
+    await new Promise((r) => setTimeout(r, 500));
+
+    expect(b.stderr()).not.toContain('slow request');
+    expect(b.stderr()).not.toContain('slow job');
+  } finally {
+    b.proc.kill('SIGTERM');
+    await b.proc.exited;
+    cleanupDb(b.dbPath);
+  }
+});
+
+test('rate-limits slow-request logging to one line per second, with a suppressed count', async () => {
+  const port = PORT + 12;
+  const b = spawnLoggingBroker(port, { CLAUDE_PEERS_SLOW_MS: '0' });
+  try {
+    await new Promise((r) => setTimeout(r, 700));
+    for (let i = 0; i < 12; i++) {
+      await fetch(`http://127.0.0.1:${port}/health`);
+    }
+    await new Promise((r) => setTimeout(r, 400));
+
+    const lines = b.stderr().split('\n').filter((l) => l.includes('slow request'));
+    expect(lines.length).toBe(1);
+
+    // The dropped lines are reported once the window closes.
+    await new Promise((r) => setTimeout(r, 900));
+    expect(b.stderr()).toMatch(/slow-request: \d+ more suppressed/);
+  } finally {
+    b.proc.kill('SIGTERM');
+    await b.proc.exited;
+    cleanupDb(b.dbPath);
+  }
+});
