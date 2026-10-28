@@ -10,6 +10,7 @@
  */
 
 import { Database } from "bun:sqlite";
+import * as os from "node:os";
 import { existsSync, mkdirSync, openSync, writeSync, fsyncSync, closeSync, chmodSync } from "node:fs";
 import type {
   RegisterRequest,
@@ -187,11 +188,11 @@ function cleanStalePeers() {
 // Parse an env var as a positive integer, falling back to the default when it
 // is missing, unparseable, or zero/negative. A NaN interval would make
 // setInterval fire in a tight loop, so this must never return NaN.
-function envInt(name: string, fallback: number): number {
+function envInt(name: string, fallback: number, min = 1): number {
   const raw = process.env[name];
   if (raw === undefined || raw.trim() === "") return fallback;
   const n = Number.parseInt(raw, 10);
-  if (!Number.isFinite(n) || n < 1) return fallback;
+  if (!Number.isFinite(n) || n < min) return fallback;
   return n;
 }
 
@@ -503,86 +504,208 @@ function handleUnregister(body: { id: string }): void {
   deletePeer.run(body.id);
 }
 
+// --- Slow-request / event-loop-lag logging ---
+//
+// The broker stalled for ~4 min on 2026-10-28 and afterwards looked healthy
+// and had logged nothing, so the cause could not be proven. These logs are the
+// evidence for next time: slow requests, slow periodic jobs, and event-loop
+// lag, each rate-limited to one line per second per kind.
+
+const SLOW_MS = envInt("CLAUDE_PEERS_SLOW_MS", 500, 0);
+const LAG_MS = 1000;
+const LOG_WINDOW_MS = 1000;
+
+let inFlightRequests = 0;
+
+function loadAvg(): string {
+  try {
+    return os.loadavg().map((n) => n.toFixed(2)).join(" ");
+  } catch {
+    return "n/a";
+  }
+}
+
+type RateBucket = {
+  lastLogged: number;
+  suppressed: number;
+  flushTimer: ReturnType<typeof setTimeout> | null;
+};
+const rateBuckets = new Map<string, RateBucket>();
+
+/**
+ * Log at most one line per second per kind, appending a "(N more suppressed)"
+ * count for whatever was dropped in the meantime. A stall can produce
+ * thousands of slow requests; this keeps the log readable.
+ */
+export function rateLimitedLog(kind: string, message: string, now: number = Date.now()): void {
+  let bucket = rateBuckets.get(kind);
+  if (!bucket) {
+    bucket = { lastLogged: 0, suppressed: 0, flushTimer: null };
+    rateBuckets.set(kind, bucket);
+  }
+  if (now - bucket.lastLogged >= LOG_WINDOW_MS) {
+    const suffix = bucket.suppressed > 0 ? ` (${bucket.suppressed} more suppressed)` : "";
+    bucket.lastLogged = now;
+    bucket.suppressed = 0;
+    console.error(message + suffix);
+    return;
+  }
+  bucket.suppressed += 1;
+  if (bucket.flushTimer === null) {
+    const b = bucket;
+    b.flushTimer = setTimeout(() => {
+      b.flushTimer = null;
+      if (b.suppressed > 0) {
+        const n = b.suppressed;
+        b.suppressed = 0;
+        b.lastLogged = Date.now();
+        console.error(`[claude-peers broker] ${kind}: ${n} more suppressed`);
+      }
+    }, LOG_WINDOW_MS);
+    b.flushTimer.unref?.();
+  }
+}
+
+export function logSlowRequest(path: string, durationMs: number): void {
+  rateLimitedLog(
+    "slow-request",
+    `[claude-peers broker] slow request ${new Date().toISOString()} ${path} ${Math.round(durationMs)}ms load=${loadAvg()}`,
+  );
+}
+
+export function logSlowJob(job: string, durationMs: number): void {
+  // Per-job kind so two different slow jobs in the same second both get a line.
+  rateLimitedLog(
+    `slow-job:${job}`,
+    `[claude-peers broker] slow job ${new Date().toISOString()} ${job} ${Math.round(durationMs)}ms load=${loadAvg()}`,
+  );
+}
+
+// Time a periodic job (cleanStalePeers, pruneMessages) and log if it overruns.
+function timedJob(name: string, fn: () => void): () => void {
+  return () => {
+    const startedAt = performance.now();
+    try {
+      fn();
+    } finally {
+      const durationMs = performance.now() - startedAt;
+      if (durationMs >= SLOW_MS) logSlowJob(name, durationMs);
+    }
+  };
+}
+
+// Every second, check how late this tick fired. The expected time accumulates
+// so a one-off delay does not desynchronize the schedule.
+function startLagMonitor(): void {
+  let expected = Date.now() + LAG_MS;
+  setInterval(() => {
+    const now = Date.now();
+    const late = now - expected;
+    expected = now + LAG_MS;
+    if (late >= LAG_MS) {
+      rateLimitedLog(
+        "event-loop-lag",
+        `[claude-peers broker] event loop lag ${new Date().toISOString()} ${late}ms load=${loadAvg()} in_flight=${inFlightRequests}`,
+      );
+    }
+  }, LAG_MS);
+}
+
 // --- HTTP Server ---
+
+async function routeRequest(req: Request, path: string): Promise<Response> {
+  if (req.method !== "POST") {
+    if (path === "/health") {
+      // Honest health: real write+read round-trip + diagnostics.
+      try {
+        sentinelRoundTrip();
+      } catch (e) {
+        const msg = e instanceof Error ? e.message : String(e);
+        return Response.json({ status: "degraded", error: msg }, { status: 500 });
+      }
+
+      const peers = (selectAllPeers.all() as Peer[]).length;
+      const uptime_s = Math.round((Date.now() - STARTED_AT) / 1000);
+      let wal_bytes = 0;
+      try {
+        wal_bytes = (await import("node:fs")).statSync(DB_PATH + "-wal").size;
+      } catch {
+        wal_bytes = 0;
+      }
+      return Response.json({ status: "ok", peers, db_writable: true, uptime_s, wal_bytes });
+    }
+    return new Response("claude-peers broker", { status: 200 });
+  }
+
+  try {
+    const body = await req.json();
+
+    switch (path) {
+      case "/register":
+        return Response.json(handleRegister(body as RegisterRequest));
+      case "/heartbeat":
+        return Response.json({ ok: true, known: handleHeartbeat(body as HeartbeatRequest) });
+      case "/set-summary":
+        handleSetSummary(body as SetSummaryRequest);
+        return Response.json({ ok: true });
+      case "/list-peers":
+        return Response.json(handleListPeers(body as ListPeersRequest));
+      case "/send-message":
+        return Response.json(handleSendMessage(body as SendMessageRequest));
+      case "/set-draining":
+        return Response.json(handleSetDraining(body as {
+          id: string;
+          draining: boolean;
+          handoff_path?: string | null;
+        }));
+      case "/poll-messages":
+        return Response.json(handlePollMessages(body as PollMessagesRequest));
+      case "/mark-delivered":
+        handleMarkDelivered(body as { ids: number[] });
+        return Response.json({ ok: true });
+      case "/unregister":
+        handleUnregister(body as { id: string });
+        return Response.json({ ok: true });
+      default:
+        return Response.json({ error: "not found" }, { status: 404 });
+    }
+  } catch (e) {
+    const msg = e instanceof Error ? e.message : String(e);
+    return Response.json({ error: msg }, { status: 500 });
+  }
+}
 
 Bun.serve({
   port: PORT,
   hostname: "127.0.0.1",
   async fetch(req) {
-    const url = new URL(req.url);
-    const path = url.pathname;
-
-    if (req.method !== "POST") {
-      if (path === "/health") {
-        // Honest health: real write+read round-trip + diagnostics.
-        try {
-          sentinelRoundTrip();
-        } catch (e) {
-          const msg = e instanceof Error ? e.message : String(e);
-          return Response.json({ status: "degraded", error: msg }, { status: 500 });
-        }
-
-        const peers = (selectAllPeers.all() as Peer[]).length;
-        const uptime_s = Math.round((Date.now() - STARTED_AT) / 1000);
-        let wal_bytes = 0;
-        try {
-          wal_bytes = (await import("node:fs")).statSync(DB_PATH + "-wal").size;
-        } catch {
-          wal_bytes = 0;
-        }
-        return Response.json({ status: "ok", peers, db_writable: true, uptime_s, wal_bytes });
-      }
-      return new Response("claude-peers broker", { status: 200 });
-    }
-
+    const path = new URL(req.url).pathname;
+    const startedAt = performance.now();
+    inFlightRequests += 1;
     try {
-      const body = await req.json();
-
-      switch (path) {
-        case "/register":
-          return Response.json(handleRegister(body as RegisterRequest));
-        case "/heartbeat":
-          return Response.json({ ok: true, known: handleHeartbeat(body as HeartbeatRequest) });
-        case "/set-summary":
-          handleSetSummary(body as SetSummaryRequest);
-          return Response.json({ ok: true });
-        case "/list-peers":
-          return Response.json(handleListPeers(body as ListPeersRequest));
-        case "/send-message":
-          return Response.json(handleSendMessage(body as SendMessageRequest));
-        case "/set-draining":
-          return Response.json(handleSetDraining(body as {
-            id: string;
-            draining: boolean;
-            handoff_path?: string | null;
-          }));
-        case "/poll-messages":
-          return Response.json(handlePollMessages(body as PollMessagesRequest));
-        case "/mark-delivered":
-          handleMarkDelivered(body as { ids: number[] });
-          return Response.json({ ok: true });
-        case "/unregister":
-          handleUnregister(body as { id: string });
-          return Response.json({ ok: true });
-        default:
-          return Response.json({ error: "not found" }, { status: 404 });
-      }
-    } catch (e) {
-      const msg = e instanceof Error ? e.message : String(e);
-      return Response.json({ error: msg }, { status: 500 });
+      return await routeRequest(req, path);
+    } finally {
+      inFlightRequests -= 1;
+      const durationMs = performance.now() - startedAt;
+      if (durationMs >= SLOW_MS) logSlowRequest(path, durationMs);
     }
   },
 });
 
 // Bind first. A duplicate broker must fail before it can mutate the shared DB.
-cleanStalePeers();
-setInterval(cleanStalePeers, 30_000);
+const cleanStalePeersTimed = timedJob("cleanStalePeers", cleanStalePeers);
+cleanStalePeersTimed();
+setInterval(cleanStalePeersTimed, 30_000);
 
 // Archive + prune old delivered messages once shortly after startup, then
 // hourly. Interval is overridable so tests can trigger a prune quickly.
 const PRUNE_INTERVAL_MS = envInt("CLAUDE_PEERS_PRUNE_INTERVAL_MS", 60 * 60_000);
-setTimeout(pruneMessages, 50);
-setInterval(pruneMessages, PRUNE_INTERVAL_MS);
+const pruneMessagesTimed = timedJob("pruneMessages", pruneMessages);
+setTimeout(pruneMessagesTimed, 50);
+setInterval(pruneMessagesTimed, PRUNE_INTERVAL_MS);
+
+// Event-loop lag monitor: the evidence trail for the next stall.
+startLagMonitor();
 
 // Idle shutdown: once no peer has been connected for IDLE_SHUTDOWN_MS (default
 // 15 minutes), exit. Sleeping panes stay registered, so sleep never triggers
