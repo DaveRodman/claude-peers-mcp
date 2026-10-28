@@ -10,6 +10,7 @@
  */
 
 import { Database } from "bun:sqlite";
+import { existsSync, mkdirSync, openSync, writeSync, fsyncSync, closeSync, chmodSync } from "node:fs";
 import type {
   RegisterRequest,
   RegisterResponse,
@@ -87,6 +88,12 @@ db.run(`
     FOREIGN KEY (to_id) REFERENCES peers(id)
   )
 `);
+
+// Index for the hot poll query (`SELECT * FROM messages WHERE to_id = ?
+// AND delivered = 0`). Without it a large messages table forces a full scan
+// on every poll from every peer. Name matches the index already present in
+// the live DB, so this is a no-op there and a fresh DB gets it too.
+db.run(`CREATE INDEX IF NOT EXISTS idx_messages_to_delivered ON messages(to_id, delivered)`);
 
 // Return `ps -p PID -o lstart=` output, or null if the PID doesn't exist.
 // macOS-specific output format but only needs to be byte-comparable across
@@ -168,6 +175,78 @@ function cleanStalePeers() {
 
   // Periodically checkpoint the WAL so it can't balloon.
   db.run("PRAGMA wal_checkpoint(TRUNCATE)");
+}
+
+// --- Message retention / archiving ---
+
+// Delivered messages older than this are archived to JSONL and deleted.
+// Undelivered messages are never touched, no matter how old.
+const RETENTION_DAYS = parseInt(process.env.CLAUDE_PEERS_RETENTION_DAYS ?? "7", 10);
+const ARCHIVE_DIR = process.env.CLAUDE_PEERS_ARCHIVE_DIR ?? `${process.env.HOME}/.claude-peers-archive`;
+const ARCHIVE_PATH = `${ARCHIVE_DIR}/messages-archive.jsonl`;
+// Rows per pass, so a large backlog can't block the broker's event loop.
+const PRUNE_BATCH = 5000;
+
+type ArchivedMessage = {
+  id: number;
+  from_id: string;
+  to_id: string;
+  sent_at: string;
+  delivered: number;
+  text: string;
+};
+
+const selectExpired = db.prepare(`
+  SELECT id, from_id, to_id, sent_at, delivered, text FROM messages
+  WHERE delivered = 1 AND sent_at < ?
+  ORDER BY sent_at ASC
+  LIMIT ?
+`);
+
+// Append the batch to the archive, fsync, and only then delete those exact ids
+// in one transaction. If anything in the append fails we delete nothing.
+function pruneMessages() {
+  try {
+    const cutoff = new Date(Date.now() - RETENTION_DAYS * 24 * 60 * 60 * 1000).toISOString();
+    const rows = selectExpired.all(cutoff, PRUNE_BATCH) as ArchivedMessage[];
+    if (rows.length === 0) return;
+
+    if (!existsSync(ARCHIVE_DIR)) {
+      mkdirSync(ARCHIVE_DIR, { recursive: true, mode: 0o700 });
+    }
+    const fileExisted = existsSync(ARCHIVE_PATH);
+    const fd = openSync(ARCHIVE_PATH, "a", 0o600);
+    try {
+      if (!fileExisted) {
+        try { chmodSync(ARCHIVE_PATH, 0o600); } catch { /* best effort */ }
+      }
+      const payload = rows
+        .map((r) => JSON.stringify({
+          id: r.id,
+          from_id: r.from_id,
+          to_id: r.to_id,
+          sent_at: r.sent_at,
+          delivered: r.delivered,
+          text: r.text,
+        }))
+        .join("\n") + "\n";
+      writeSync(fd, payload);
+      fsyncSync(fd);
+    } finally {
+      closeSync(fd);
+    }
+
+    const ids = rows.map((r) => r.id);
+    const deleteBatch = db.transaction((batch: number[]) => {
+      const del = db.prepare("DELETE FROM messages WHERE id = ?");
+      for (const id of batch) del.run(id);
+    });
+    deleteBatch(ids);
+
+    console.error(`[claude-peers broker] archived ${rows.length} delivered message(s) older than ${RETENTION_DAYS}d to ${ARCHIVE_PATH}`);
+  } catch (e) {
+    console.error("[claude-peers broker] message archive failed; nothing deleted:", e);
+  }
 }
 
 // --- Prepared statements ---
@@ -456,6 +535,15 @@ Bun.serve({
 // Bind first. A duplicate broker must fail before it can mutate the shared DB.
 cleanStalePeers();
 setInterval(cleanStalePeers, 30_000);
+
+// Archive + prune old delivered messages once shortly after startup, then
+// hourly. Interval is overridable so tests can trigger a prune quickly.
+const PRUNE_INTERVAL_MS = parseInt(
+  process.env.CLAUDE_PEERS_PRUNE_INTERVAL_MS ?? String(60 * 60_000),
+  10,
+);
+setTimeout(pruneMessages, 50);
+setInterval(pruneMessages, PRUNE_INTERVAL_MS);
 
 // Idle shutdown: once no peer has been connected for IDLE_SHUTDOWN_MS (default
 // 15 minutes), exit. Sleeping panes stay registered, so sleep never triggers
