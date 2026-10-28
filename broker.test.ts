@@ -1,5 +1,6 @@
 import { test, expect, beforeAll, afterAll } from "bun:test";
 import { Database } from "bun:sqlite";
+import { statSync, rmSync, mkdirSync, chmodSync } from 'node:fs';
 
 const PORT = 7901;
 const DB = `/tmp/cp-test-${crypto.randomUUID()}.db`;
@@ -169,5 +170,200 @@ test("a time-zone change does not evict live peers, but a recycled PID still doe
     try { Bun.file(isolatedDb).delete(); } catch {}
     try { Bun.file(isolatedDb + "-wal").delete(); } catch {}
     try { Bun.file(isolatedDb + "-shm").delete(); } catch {}
+  }
+});
+
+
+// --- Retention / archiving ---
+
+const DAY_MS = 24 * 60 * 60 * 1000;
+
+function seedRetentionDb(
+  path: string,
+  rows: { from_id: string; to_id: string; text: string; sent_at: string; delivered: number }[],
+) {
+  const seed = new Database(path);
+  seed.run(`CREATE TABLE peers (id TEXT PRIMARY KEY, pid INTEGER NOT NULL, cwd TEXT NOT NULL,
+    git_root TEXT, tty TEXT, summary TEXT NOT NULL DEFAULT '', registered_at TEXT NOT NULL,
+    last_seen TEXT NOT NULL, process_start TEXT)`);
+  seed.run(
+    "INSERT INTO peers VALUES (?, ?, ?, NULL, NULL, '', ?, ?, NULL)",
+    ['self', process.pid, process.cwd(), new Date().toISOString(), new Date().toISOString()],
+  );
+  seed.run(`CREATE TABLE messages (id INTEGER PRIMARY KEY AUTOINCREMENT, from_id TEXT NOT NULL,
+    to_id TEXT NOT NULL, text TEXT NOT NULL, sent_at TEXT NOT NULL, delivered INTEGER NOT NULL DEFAULT 0)`);
+  const ins = seed.prepare(
+    'INSERT INTO messages (from_id, to_id, text, sent_at, delivered) VALUES (?, ?, ?, ?, ?)',
+  );
+  for (const r of rows) ins.run(r.from_id, r.to_id, r.text, r.sent_at, r.delivered);
+  seed.close();
+}
+
+test('creates the poll and prune indexes on a fresh database', async () => {
+  const inspect = new Database(DB);
+  const names = (inspect.query(
+    `SELECT name FROM sqlite_master WHERE type = 'index' AND name LIKE 'idx_messages%'`,
+  ).all() as { name: string }[])
+    .map((r) => r.name)
+    .sort();
+  inspect.close();
+  expect(names).toEqual(['idx_messages_delivered_sent', 'idx_messages_to_delivered']);
+});
+
+test('archives old delivered messages, keeps recent and undelivered ones', async () => {
+  const port = PORT + 3;
+  const dbPath = `/tmp/cp-test-${crypto.randomUUID()}.db`;
+  const archiveDir = `/tmp/cp-archive-${crypto.randomUUID()}`;
+  const archivePath = `${archiveDir}/messages-archive.jsonl`;
+  const old = new Date(Date.now() - 10 * DAY_MS).toISOString();
+  const recent = new Date().toISOString();
+  seedRetentionDb(dbPath, [
+    { from_id: 'a', to_id: 'self', text: 'old delivered', sent_at: old, delivered: 1 },
+    { from_id: 'a', to_id: 'self', text: 'recent delivered', sent_at: recent, delivered: 1 },
+    { from_id: 'a', to_id: 'self', text: 'old undelivered', sent_at: old, delivered: 0 },
+  ]);
+  const proc = Bun.spawn([process.execPath, 'broker.ts'], {
+    env: { ...process.env, CLAUDE_PEERS_PORT: String(port), CLAUDE_PEERS_DB: dbPath,
+      CLAUDE_PEERS_ARCHIVE_DIR: archiveDir },
+    cwd: import.meta.dir,
+    stdout: 'ignore',
+    stderr: 'inherit',
+  });
+  try {
+    await new Promise((r) => setTimeout(r, 1200));
+
+    const lines = (await Bun.file(archivePath).text()).split('\n').filter((l) => l.length > 0);
+    expect(lines.length).toBe(1);
+    const entry = JSON.parse(lines[0]!);
+    expect(Object.keys(entry).sort()).toEqual(['delivered', 'from_id', 'id', 'sent_at', 'text', 'to_id']);
+    expect(entry.text).toBe('old delivered');
+    expect(entry.delivered).toBe(1);
+    expect(typeof entry.id).toBe('number');
+
+    const check = new Database(dbPath);
+    const remaining = (check.query('SELECT text FROM messages').all() as { text: string }[])
+      .map((r) => r.text)
+      .sort();
+    check.close();
+    expect(remaining).toEqual(['old undelivered', 'recent delivered']);
+
+    expect(statSync(archiveDir).mode & 0o777).toBe(0o700);
+    expect(statSync(archivePath).mode & 0o777).toBe(0o600);
+  } finally {
+    proc.kill('SIGTERM');
+    await proc.exited;
+    rmSync(archiveDir, { recursive: true, force: true });
+    try { Bun.file(dbPath).delete(); } catch {}
+    try { Bun.file(dbPath + '-wal').delete(); } catch {}
+    try { Bun.file(dbPath + '-shm').delete(); } catch {}
+  }
+});
+
+test('appends to an existing archive instead of overwriting it', async () => {
+  const port = PORT + 4;
+  const dbPath = `/tmp/cp-test-${crypto.randomUUID()}.db`;
+  const archiveDir = `/tmp/cp-archive-${crypto.randomUUID()}`;
+  const archivePath = `${archiveDir}/messages-archive.jsonl`;
+  mkdirSync(archiveDir, { recursive: true, mode: 0o700 });
+  const sentinel = JSON.stringify({ id: 999999, from_id: 'z', to_id: 'z',
+    sent_at: '2001-01-01T00:00:00.000Z', delivered: 1, text: 'pre-existing' });
+  await Bun.write(archivePath, sentinel + '\n');
+
+  const old = new Date(Date.now() - 10 * DAY_MS).toISOString();
+  seedRetentionDb(dbPath, [
+    { from_id: 'a', to_id: 'self', text: 'to be archived', sent_at: old, delivered: 1 },
+  ]);
+  const proc = Bun.spawn([process.execPath, 'broker.ts'], {
+    env: { ...process.env, CLAUDE_PEERS_PORT: String(port), CLAUDE_PEERS_DB: dbPath,
+      CLAUDE_PEERS_ARCHIVE_DIR: archiveDir },
+    cwd: import.meta.dir,
+    stdout: 'ignore',
+    stderr: 'inherit',
+  });
+  try {
+    await new Promise((r) => setTimeout(r, 1200));
+    const lines = (await Bun.file(archivePath).text()).split('\n').filter((l) => l.length > 0);
+    expect(lines.length).toBe(2);
+    expect(JSON.parse(lines[0]!).text).toBe('pre-existing');
+    expect(JSON.parse(lines[1]!).text).toBe('to be archived');
+  } finally {
+    proc.kill('SIGTERM');
+    await proc.exited;
+    rmSync(archiveDir, { recursive: true, force: true });
+    try { Bun.file(dbPath).delete(); } catch {}
+    try { Bun.file(dbPath + '-wal').delete(); } catch {}
+    try { Bun.file(dbPath + '-shm').delete(); } catch {}
+  }
+});
+
+
+test('deletes nothing when the archive append fails', async () => {
+  const port = PORT + 5;
+  const dbPath = `/tmp/cp-test-${crypto.randomUUID()}.db`;
+  const archiveDir = `/tmp/cp-archive-${crypto.randomUUID()}`;
+  mkdirSync(archiveDir, { recursive: true, mode: 0o700 });
+  // Read-only dir: the broker cannot create/open the archive file for append.
+  chmodSync(archiveDir, 0o500);
+  const old = new Date(Date.now() - 10 * DAY_MS).toISOString();
+  seedRetentionDb(dbPath, [
+    { from_id: 'a', to_id: 'self', text: 'must survive', sent_at: old, delivered: 1 },
+  ]);
+  const proc = Bun.spawn([process.execPath, 'broker.ts'], {
+    env: { ...process.env, CLAUDE_PEERS_PORT: String(port), CLAUDE_PEERS_DB: dbPath,
+      CLAUDE_PEERS_ARCHIVE_DIR: archiveDir },
+    cwd: import.meta.dir,
+    stdout: 'ignore',
+    stderr: 'inherit',
+  });
+  try {
+    await new Promise((r) => setTimeout(r, 1200));
+    const check = new Database(dbPath);
+    const remaining = (check.query('SELECT text FROM messages').all() as { text: string }[])
+      .map((r) => r.text);
+    check.close();
+    expect(remaining).toEqual(['must survive']);
+    expect(await Bun.file(`${archiveDir}/messages-archive.jsonl`).exists()).toBe(false);
+  } finally {
+    proc.kill('SIGTERM');
+    await proc.exited;
+    chmodSync(archiveDir, 0o700);
+    rmSync(archiveDir, { recursive: true, force: true });
+    try { Bun.file(dbPath).delete(); } catch {}
+    try { Bun.file(dbPath + '-wal').delete(); } catch {}
+    try { Bun.file(dbPath + '-shm').delete(); } catch {}
+  }
+});
+
+test('falls back to the default retention when the env value is unparseable', async () => {
+  const port = PORT + 6;
+  const dbPath = `/tmp/cp-test-${crypto.randomUUID()}.db`;
+  const archiveDir = `/tmp/cp-archive-${crypto.randomUUID()}`;
+  const archivePath = `${archiveDir}/messages-archive.jsonl`;
+  const eightDays = new Date(Date.now() - 8 * DAY_MS).toISOString();
+  seedRetentionDb(dbPath, [
+    { from_id: 'a', to_id: 'self', text: 'past default window', sent_at: eightDays, delivered: 1 },
+  ]);
+  const proc = Bun.spawn([process.execPath, 'broker.ts'], {
+    env: { ...process.env, CLAUDE_PEERS_PORT: String(port), CLAUDE_PEERS_DB: dbPath,
+      CLAUDE_PEERS_ARCHIVE_DIR: archiveDir, CLAUDE_PEERS_RETENTION_DAYS: 'abc' },
+    cwd: import.meta.dir,
+    stdout: 'ignore',
+    stderr: 'inherit',
+  });
+  try {
+    await new Promise((r) => setTimeout(r, 1200));
+    const lines = (await Bun.file(archivePath).text()).split('\n').filter((l) => l.length > 0);
+    expect(lines.length).toBe(1);
+    const check = new Database(dbPath);
+    const count = check.query('SELECT COUNT(*) AS n FROM messages').get() as { n: number };
+    check.close();
+    expect(count.n).toBe(0);
+  } finally {
+    proc.kill('SIGTERM');
+    await proc.exited;
+    rmSync(archiveDir, { recursive: true, force: true });
+    try { Bun.file(dbPath).delete(); } catch {}
+    try { Bun.file(dbPath + '-wal').delete(); } catch {}
+    try { Bun.file(dbPath + '-shm').delete(); } catch {}
   }
 });
