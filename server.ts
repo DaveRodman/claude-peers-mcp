@@ -43,12 +43,26 @@ const BROKER_SCRIPT = new URL("./broker.ts", import.meta.url).pathname;
 const BROKER_LOG = process.env.CLAUDE_PEERS_BROKER_LOG ?? `${process.env.HOME}/.claude-peers-broker.log`;
 
 // Poke retry policy. When the wake-poke finds the pane focused (which a
-// locked screen also reports), retry every POKE_RETRY_MS until there is no
-// undelivered mail left for this peer, or POKE_MAX_MS elapses. Never retry
-// forever: 2 h of a queued report is already too long.
-const POKE_RETRY_MS = parseInt(process.env.CLAUDE_PEERS_POKE_RETRY_MS ?? "30000", 10);
+// locked screen also reports) or the osascript call fails, retry every
+// POKE_RETRY_MS until there is no undelivered mail left for this peer, or
+// POKE_MAX_MS elapses. Never retry forever: 2 h of a queued report is
+// already too long.
+//
+// Guarded parse: a NaN or sub-second value would make Bun.sleep return
+// instantly and turn the retry loop into an osascript spawn storm.
+export function parsePokeRetryMs(raw: string | undefined): number {
+  if (raw === undefined || raw.trim() === "") return 30_000;
+  const n = Number.parseInt(raw, 10);
+  if (!Number.isFinite(n) || n < 1000) return 30_000;
+  return n;
+}
+const POKE_RETRY_MS = parsePokeRetryMs(process.env.CLAUDE_PEERS_POKE_RETRY_MS);
 const POKE_MAX_MS = 2 * 60 * 60_000;
 const POKE_LOG_MAX_BYTES = 1_000_000;
+// Scoped timeouts so a stalled broker or a hung osascript can never wedge
+// the retry loop — a wedged loop would hold the single-loop guard forever.
+const POKE_PROBE_TIMEOUT_MS = 3_000;
+const POKE_OSASCRIPT_TIMEOUT_MS = 10_000;
 
 // Only top-level sessions (a swarm coordinator, or a peer session Dave opens
 // himself) may start the broker. Swarm workers are launched with
@@ -69,11 +83,12 @@ export function shouldReregister(
 
 // --- Broker communication ---
 
-async function brokerFetch<T>(path: string, body: unknown): Promise<T> {
+async function brokerFetch<T>(path: string, body: unknown, timeoutMs?: number): Promise<T> {
   const res = await fetch(`${BROKER_URL}${path}`, {
     method: "POST",
     headers: { "Content-Type": "application/json" },
     body: JSON.stringify(body),
+    ...(timeoutMs ? { signal: AbortSignal.timeout(timeoutMs) } : {}),
   });
   if (!res.ok) {
     const err = await res.text();
@@ -602,15 +617,34 @@ export function logPoke(label: string, detail = ""): void {
 
 // Undelivered mail for this peer? /poll-messages returns undelivered rows
 // WITHOUT marking them delivered, so this is a safe read-only probe.
-async function hasUndeliveredMail(): Promise<boolean> {
-  if (!myId) return false;
+//
+// Always bounded by a timeout: a stalled broker is exactly the failure this
+// retry loop exists to survive, so the probe must never hang the loop (which
+// would hold the single-loop guard forever). A timeout or any error counts
+// as "can't tell" — keep retrying rather than stop early.
+export async function probeUndelivered(
+  id: string,
+  url: string,
+  timeoutMs: number = POKE_PROBE_TIMEOUT_MS,
+): Promise<boolean> {
   try {
-    const result = await brokerFetch<PollMessagesResponse>("/poll-messages", { id: myId });
-    return result.messages.length > 0;
+    const res = await fetch(`${url}/poll-messages`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ id }),
+      signal: AbortSignal.timeout(timeoutMs),
+    });
+    if (!res.ok) return true;
+    const data = (await res.json()) as PollMessagesResponse;
+    return data.messages.length > 0;
   } catch {
-    // Broker unreachable — can't tell. Keep retrying rather than stop early.
     return true;
   }
+}
+
+async function hasUndeliveredMail(): Promise<boolean> {
+  if (!myId) return false;
+  return probeUndelivered(myId, BROKER_URL, POKE_PROBE_TIMEOUT_MS);
 }
 
 // One osascript poke. Returns "poked" | "focused" | "not-found" | "error".
@@ -645,12 +679,91 @@ end tell`;
       stdout: "pipe",
       stderr: "ignore",
     });
-    const out = (await new Response(proc.stdout).text()).trim();
-    await proc.exited;
-    return out || "not-found";
+    let timedOut = false;
+    const killTimer = setTimeout(() => {
+      timedOut = true;
+      try { proc.kill(); } catch { /* already gone */ }
+    }, POKE_OSASCRIPT_TIMEOUT_MS);
+    try {
+      const out = (await new Response(proc.stdout).text()).trim();
+      await proc.exited;
+      if (timedOut) return "error";
+      return out || "not-found";
+    } finally {
+      clearTimeout(killTimer);
+    }
   } catch {
     // Non-fatal: poke is a UX accelerator, not load-bearing for delivery.
     return "error";
+  }
+}
+
+export type PokeLoopDeps = {
+  attempt: (sessionId: string) => Promise<string>;
+  hasMail: () => Promise<boolean>;
+  sleep: (ms: number) => Promise<void>;
+  now: () => number;
+  log: (label: string, detail?: string) => void;
+  retryMs: number;
+  maxMs: number;
+};
+
+// The retry loop, with its iTerm runner, mail probe, clock and logger
+// injected so the whole loop can be tested without iTerm.
+//
+// "focused" (which a locked screen also reports) and "error" (osascript
+// failed) both retry; "not-found" (pane gone) ends the loop; "poked" is done.
+export async function runPokeLoop(sessionId: string, deps: PokeLoopDeps): Promise<void> {
+  const startedAt = deps.now();
+  for (;;) {
+    const outcome = await deps.attempt(sessionId);
+    const elapsedMs = deps.now() - startedAt;
+
+    if (outcome === "poked") {
+      deps.log("sent", `outcome=poked elapsed=${elapsedMs}ms`);
+      return;
+    }
+    if (outcome === "not-found") {
+      deps.log("skipped-no-pane", `outcome=not-found elapsed=${elapsedMs}ms`);
+      return;
+    }
+
+    const decision = decidePoke({
+      elapsedMs,
+      maxMs: deps.maxMs,
+      hasUndeliveredMail: await deps.hasMail(),
+    });
+    if (decision === "retry") {
+      deps.log(
+        outcome === "focused" ? "deferred-focused" : "deferred-error",
+        `elapsed=${elapsedMs}ms retry_in=${deps.retryMs}ms`,
+      );
+      await deps.sleep(deps.retryMs);
+      continue;
+    }
+    deps.log(decision, `elapsed=${elapsedMs}ms`);
+    return;
+  }
+}
+
+// Single-loop guard wrapper: acquire, run, always release. A second message
+// arriving mid-loop is skipped, and that skip is logged at most once per
+// loop rather than on every poll.
+let pokeLoopSkipLogged = false;
+
+export async function runPokeWithGuard(sessionId: string, deps: PokeLoopDeps): Promise<void> {
+  if (!tryAcquirePokeLoop()) {
+    if (!pokeLoopSkipLogged) {
+      pokeLoopSkipLogged = true;
+      deps.log("skipped-loop-active", `session=${sessionId}`);
+    }
+    return;
+  }
+  pokeLoopSkipLogged = false;
+  try {
+    await runPokeLoop(sessionId, deps);
+  } finally {
+    releasePokeLoop();
   }
 }
 
@@ -660,38 +773,16 @@ end tell`;
 // up after 3 s. A locked screen reports the pane as focused too, so the loop
 // keeps retrying until there is no undelivered mail left for this peer or the
 // 2 h cap is hit. Only one loop runs at a time (see tryAcquirePokeLoop).
-async function pokeItermSession(sessionId: string): Promise<void> {
-  if (!tryAcquirePokeLoop()) {
-    logPoke("skipped-loop-active", `session=${sessionId}`);
-    return;
-  }
-  const startedAt = Date.now();
-  try {
-    for (;;) {
-      const outcome = await attemptPoke(sessionId);
-      const elapsedMs = Date.now() - startedAt;
-
-      if (outcome !== "focused") {
-        logPoke(outcome === "poked" ? "sent" : "error", `outcome=${outcome} elapsed=${elapsedMs}ms`);
-        return;
-      }
-
-      const decision = decidePoke({
-        elapsedMs,
-        maxMs: POKE_MAX_MS,
-        hasUndeliveredMail: await hasUndeliveredMail(),
-      });
-      if (decision === "retry") {
-        logPoke("deferred-focused", `elapsed=${elapsedMs}ms retry_in=${POKE_RETRY_MS}ms`);
-        await Bun.sleep(POKE_RETRY_MS);
-        continue;
-      }
-      logPoke(decision, `elapsed=${elapsedMs}ms`);
-      return;
-    }
-  } finally {
-    releasePokeLoop();
-  }
+function pokeItermSession(sessionId: string): Promise<void> {
+  return runPokeWithGuard(sessionId, {
+    attempt: attemptPoke,
+    hasMail: hasUndeliveredMail,
+    sleep: (ms) => Bun.sleep(ms),
+    now: Date.now,
+    log: logPoke,
+    retryMs: POKE_RETRY_MS,
+    maxMs: POKE_MAX_MS,
+  });
 }
 
 // --- Polling loop for inbound messages ---
